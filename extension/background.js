@@ -1,7 +1,5 @@
-importScripts('db.js');
-
 /**
- * Unlockt (v6.8) - Chromium Extension Background Service Worker
+ * Unlockt (v6.7) - Chromium Extension Background Service Worker
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * Developed by: Mahmoud Madi (Digital Marketing & IT Specialist)
  * Organizations: Premier Tech (For Integrated Solutions) & VOXO AI (AI & Media Agency)
@@ -20,14 +18,12 @@ importScripts('db.js');
 // State - reset at start
 let syncState = {
     isRunning: false,
-    isFinished: false,
     progress: 0,
     total: 0,
     currentType: '',
     error: null,
-    lastResult: null,
     options: {
-        downloadMedia: true
+        downloadMedia: true // Default to true
     }
 };
 
@@ -36,17 +32,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     console.log('Received message:', request.action);
 
     if (request.action === 'startSync') {
-        // IMMEDIATELY reset syncState BEFORE any async work
-        syncState = {
-            isRunning: true,
-            isFinished: false,
-            progress: 5,
-            total: 0,
-            currentType: 'Starting sync...',
-            error: null,
-            lastResult: null,
-            options: { downloadMedia: request.options?.downloadMedia !== false }
-        };
+        // Store options
+        syncState.options.downloadMedia = request.options?.downloadMedia !== false;
 
         startFullSync(false) // Fresh sync
             .then(result => {
@@ -62,18 +49,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
 
     if (request.action === 'continueSync') {
-        // IMMEDIATELY reset syncState BEFORE any async work
-        // This prevents the popup poller from seeing stale isFinished/lastResult
-        syncState = {
-            isRunning: true,
-            isFinished: false,
-            progress: 5,
-            total: 0,
-            currentType: 'Resuming sync...',
-            error: null,
-            lastResult: null,
-            options: { downloadMedia: request.options?.downloadMedia !== false }
-        };
+        // Store options
+        syncState.options.downloadMedia = request.options?.downloadMedia !== false;
+        
+        // Continue from last saved position
+        if (syncState.isRunning) {
+            console.log('Resetting stuck sync state');
+            syncState.isRunning = false;
+        }
 
         startFullSync(true, false) // Resume sync, not incremental
             .then(result => {
@@ -89,17 +72,14 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
 
     if (request.action === 'syncNewOnly') {
-        // IMMEDIATELY reset syncState BEFORE any async work
-        syncState = {
-            isRunning: true,
-            isFinished: false,
-            progress: 5,
-            total: 0,
-            currentType: 'Checking for new saves...',
-            error: null,
-            lastResult: null,
-            options: { downloadMedia: request.options?.downloadMedia !== false }
-        };
+        // Store options
+        syncState.options.downloadMedia = request.options?.downloadMedia !== false;
+
+        // Only sync new content (incremental)
+        if (syncState.isRunning) {
+            console.log('Resetting stuck sync state');
+            syncState.isRunning = false;
+        }
 
         startFullSync(false, true) // Fresh start but incremental mode
             .then(result => {
@@ -196,33 +176,29 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 async function checkInstagramLogin() {
     try {
         console.log('Checking Instagram login...');
-        let cookies = [];
-        try {
-            cookies = await chrome.cookies.getAll({ url: 'https://www.instagram.com' });
-        } catch (e) {}
-        if (!cookies || cookies.length === 0) {
-            try {
-                cookies = await chrome.cookies.getAll({ domain: '.instagram.com' });
-            } catch (e) {}
-        }
-        if (!cookies || cookies.length === 0) {
-            try {
-                cookies = await chrome.cookies.getAll({ domain: 'instagram.com' });
-            } catch (e) {}
-        }
+        const cookies = await chrome.cookies.getAll({ domain: '.instagram.com' });
+        console.log('Found', cookies.length, 'cookies');
 
         const sessionId = cookies.find(c => c.name === 'sessionid');
         const userId = cookies.find(c => c.name === 'ds_user_id');
 
-        console.log('Cookies found:', cookies.length, '| Session ID:', !!sessionId, '| User ID:', !!userId);
+        console.log('Session ID found:', !!sessionId);
+        console.log('User ID found:', !!userId);
 
         if (sessionId && userId) {
             const userInfo = await fetchUserInfo(userId.value);
 
+            // Sync user profile info to local storage & server if detected
             if (userInfo.username && userInfo.username !== 'User') {
                 try {
-                    await VaultDB.setUser(userInfo);
-                } catch (e) {}
+                    await fetch('http://localhost:3000/api/user/profile', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(userInfo)
+                    });
+                } catch (e) {
+                    console.log('Could not post userInfo to server:', e);
+                }
             }
 
             return {
@@ -233,24 +209,6 @@ async function checkInstagramLogin() {
                 profilePic: userInfo.profilePic
             };
         }
-
-        // Check if there is an active tab on instagram.com with logged in profile
-        try {
-            const tabs = await chrome.tabs.query({ url: '*://*.instagram.com/*' });
-            if (tabs && tabs.length > 0) {
-                const stored = await chrome.storage.local.get('userInfo');
-                if (stored?.userInfo?.username && stored.userInfo.username !== 'User') {
-                    return {
-                        loggedIn: true,
-                        userId: stored.userInfo.userId || 'user',
-                        username: stored.userInfo.username,
-                        fullName: stored.userInfo.fullName,
-                        profilePic: stored.userInfo.profilePic
-                    };
-                }
-            }
-        } catch (e) {}
-
         return { loggedIn: false };
     } catch (error) {
         console.error('Error checking login:', error);
@@ -271,22 +229,16 @@ function cleanText(str) {
 
 // Fetch complete user info (username, full_name, profile_pic) with robust multi-strategy fallbacks
 async function fetchUserInfo(userId) {
-    // Strategy 0: Check chrome.storage.local cache first (0ms instant return)
+    // Strategy 0: Check chrome.storage.local cache first
     try {
         const stored = await chrome.storage.local.get('userInfo');
-        if (stored?.userInfo && stored.userInfo.username && stored.userInfo.username !== 'User') {
+        if (stored?.userInfo && stored.userInfo.userId === userId && stored.userInfo.username && stored.userInfo.username !== 'User') {
             stored.userInfo.fullName = cleanText(stored.userInfo.fullName || stored.userInfo.username);
             stored.userInfo.profilePic = cleanText(stored.userInfo.profilePic || '');
-            // Refresh in background without blocking
-            fetchUserInfoFromWeb(userId).catch(() => {});
             return stored.userInfo;
         }
     } catch (e) {}
 
-    return await fetchUserInfoFromWeb(userId);
-}
-
-async function fetchUserInfoFromWeb(userId) {
     let userInfo = {
         userId: userId,
         username: 'User',
@@ -404,22 +356,12 @@ async function fetchUserInfoFromWeb(userId) {
 async function startFullSync(resume = false, incremental = false) {
     console.log(resume ? 'Starting resume sync...' : (incremental ? 'Starting incremental sync...' : 'Starting fresh sync...'));
 
-    await VaultDB.init();
-
-    // Reset cursor ONLY on explicit fresh sync
-    if (!resume && !incremental) {
-        await chrome.storage.local.remove(['syncCursor', 'syncProgress', 'syncTimestamp', 'syncPhase', 'syncGraphqlCursor']);
-    }
-
     syncState = {
         isRunning: true,
-        isFinished: false,
         progress: 5,
         total: 0,
-        currentType: resume ? 'Resuming sync...' : (incremental ? 'Checking for new saves...' : 'Connecting to Instagram...'),
-        error: null,
-        lastResult: null,
-        options: syncState.options || { downloadMedia: true }
+        currentType: resume ? 'Resuming sync...' : 'Connecting to Instagram...',
+        error: null
     };
 
     try {
@@ -431,82 +373,93 @@ async function startFullSync(resume = false, incremental = false) {
         }
 
         const userId = loginStatus.userId;
+        let existingContent = [];
         let resumeCursor = null;
-        let resumePhase = 'rest';
-        let resumeGraphqlCursor = null;
 
-        // If resuming, get the saved cursor
+        // If resuming, get the saved cursor and load existing content
         if (resume) {
             console.log('[RESUME] Attempting to load saved cursor...');
             const cursorData = await getSyncCursor();
-            console.log('[RESUME] Got cursor data:', JSON.stringify(cursorData));
+            console.log('[RESUME] Got cursor data:', cursorData);
 
-            if (cursorData) {
-                resumePhase = cursorData.phase || 'rest';
-                resumeGraphqlCursor = cursorData.graphqlCursor || null;
-                if (cursorData.cursor) {
-                    resumeCursor = cursorData.cursor;
-                    console.log('[RESUME] Will resume from cursor:', resumeCursor.substring(0, 50) + '...');
+            if (cursorData && cursorData.cursor) {
+                resumeCursor = cursorData.cursor;
+                syncState.currentType = `Resuming from item ${cursorData.itemCount}...`;
+                console.log('[RESUME] Will resume from cursor:', resumeCursor.substring(0, 50) + '...');
+
+                // Load existing synced content from server
+                try {
+                    const response = await fetch('http://localhost:3000/api/saved?limit=10000');
+                    const data = await response.json();
+                    if (data.success && data.data) {
+                        existingContent = data.data;
+                        console.log('[RESUME] Loaded', existingContent.length, 'existing items from server');
+                    }
+                } catch (e) {
+                    console.log('[RESUME] Could not load existing content:', e.message);
                 }
-                syncState.currentType = `Resuming from saved position (${cursorData.itemCount || 0} items)...`;
             } else {
-                console.log('[RESUME] No saved cursor found, starting fresh sync...');
-                syncState.currentType = 'Starting sync...';
+                console.log('[RESUME] WARNING: No saved cursor found! Starting fresh instead.');
+                syncState.currentType = 'No saved position, starting fresh...';
             }
         }
 
-        // PHASE 1: Fetch saved posts via REST API (skip if resume phase is graphql)
-        if (resumePhase !== 'graphql') {
-            syncState.currentType = resume && resumeCursor ? 'Continuing fetch...' : (incremental ? 'Fetching new saves...' : 'Fetching saved posts...');
-            syncState.progress = 15;
-            console.log('Fetching saved posts (REST API)...');
+        const allContent = [...existingContent];
 
-            const posts = await fetchSavedPosts(userId, resumeCursor, incremental, loginStatus);
-            console.log('REST API returned', posts.length, 'items');
-        } else {
-            console.log('[RESUME] Skipping REST (already exhausted), going straight to GraphQL...');
-        }
+        // Fetch saved posts with "Sync-as-you-go" batches
+        syncState.currentType = resume && resumeCursor ? 'Continuing fetch...' : 'Fetching saved posts...';
+        syncState.progress = 15;
+        console.log('Fetching saved posts (batch mode)...');
 
-        syncState.progress = 40;
+        // fetchSavedPosts now takes loginStatus to handle intermediate syncing
+        const posts = await fetchSavedPosts(userId, resumeCursor, incremental, loginStatus);
 
-        // PHASE 2: Fetch older history via GraphQL (always run for non-incremental, or resume from graphql phase)
-        if (!incremental) {
-            syncState.currentType = 'Fetching older saved content (deep history)...';
-            console.log('[DEEP HISTORY] Running GraphQL deep history fetch...');
+        // Add final posts if any weren't synced in the last batch
+        const existingIds = new Set(existingContent.map(i => i.id));
+        const newPosts = posts.filter(p => !existingIds.has(p.id));
+        allContent.push(...newPosts);
+        console.log('Final fetch state:', allContent.length, 'total items');
+        
+                // ✅ FIX 2 — Filet de sécurité : renvoie TOUT ce qui a été accumulé.
+        // Utile en cas d'interruption du batch par page ou de reprise depuis un curseur.
+        if (allContent.length > 0) {
+            console.log(`📦 Final safety sync: sending ${allContent.length} accumulated items to server...`);
             try {
-                const gqlCursor = resumeGraphqlCursor || null;
-                const gqlItems = await fetchSavedViaGraphQL(userId, gqlCursor, loginStatus);
-                console.log('[DEEP HISTORY] GraphQL returned', gqlItems.length, 'items');
+                await sendToLocalServer(allContent, loginStatus);
             } catch (e) {
-                console.log('GraphQL deep history note:', e.message);
+                console.error('Final safety sync failed:', e.message);
+                // On ne throw pas : le sync par page a déjà sauvé ce qu'il pouvait
             }
         }
 
-        syncState.progress = 65;
+        syncState.progress = 50;
+        syncState.total = allContent.length;
 
-        // PHASE 3: Fetch saved reels feed
+        // Try to fetch reels (may fail if not available)
         syncState.currentType = 'Checking for reels...';
         try {
             const reels = await fetchSavedReels(userId);
             if (reels.length > 0) {
+                // Batch sync reels immediately
                 await sendToLocalServer(reels, loginStatus);
-                if (syncState.options.downloadMedia !== false) {
-                    cacheThumbnailsToServer(reels).catch(() => {});
-                }
+                await cacheThumbnailsToServer(reels);
+                allContent.push(...reels);
             }
             console.log('Fetched', reels.length, 'reels');
         } catch (e) {
             console.log('Could not fetch reels:', e.message);
         }
 
-        syncState.progress = 80;
+        syncState.progress = 75;
 
-        // PHASE 4: Fetch saved audio
+        // Try to fetch audio
         syncState.currentType = 'Checking for audio...';
         try {
             const audio = await fetchSavedAudio(userId);
             if (audio.length > 0) {
                 await sendToLocalServer(audio, loginStatus);
+                // Audio covers are usually small/robust, can cache now or later
+                allContent.push(...audio);
             }
             console.log('Fetched', audio.length, 'audio tracks');
         } catch (e) {
@@ -516,50 +469,35 @@ async function startFullSync(resume = false, incremental = false) {
         syncState.progress = 95;
         syncState.currentType = 'Sync complete!';
 
-        // Read ACTUAL unique items directly from VaultDB
-        const finalVaultItems = await VaultDB.getAllPosts();
-        const postCount = finalVaultItems.filter(i => i.type === 'post' || i.type === 'carousel').length;
-        const reelCount = finalVaultItems.filter(i => i.type === 'reel').length;
-        const audioCount = finalVaultItems.filter(i => i.type === 'audio').length;
-        const totalCount = finalVaultItems.length;
+        // Count by type
+        const postCount = allContent.filter(i => i.type === 'post').length;
+        const reelCount = allContent.filter(i => i.type === 'reel').length;
+        const audioCount = allContent.filter(i => i.type === 'audio').length;
 
         syncState = {
             isRunning: false,
-            isFinished: true,
             progress: 100,
-            total: totalCount,
+            total: allContent.length,
             currentType: 'Complete!',
-            error: null,
-            lastResult: {
-                success: true,
-                count: totalCount,
-                posts: postCount,
-                reels: reelCount,
-                audio: audioCount,
-                timestamp: Date.now()
-            }
+            error: null
         };
 
-        try {
-            await chrome.storage.local.set({ 
-                lastSyncResult: syncState.lastResult,
-                savedContentCount: totalCount,
-                lastSync: new Date().toISOString()
-            });
-        } catch (e) {}
-
-        return syncState.lastResult;
+        return {
+            success: true,
+            count: allContent.length,
+            posts: postCount,
+            reels: reelCount,
+            audio: audioCount
+        };
 
     } catch (error) {
         console.error('Sync error:', error);
         syncState = {
             isRunning: false,
-            isFinished: true,
             progress: 0,
             total: 0,
             currentType: 'Error',
-            error: error.message,
-            lastResult: { success: false, error: error.message }
+            error: error.message
         };
         throw error;
     }
@@ -568,21 +506,23 @@ async function startFullSync(resume = false, incremental = false) {
 // Fetch saved posts with resume capability and incremental sync
 async function fetchSavedPosts(userId, resumeFromCursor = null, incremental = false, loginStatus = null) {
     const allItems = [];
-    let maxId = resumeFromCursor;
+    let maxId = resumeFromCursor; // Start from saved cursor if resuming
     let hasMore = true;
     let attempts = 0;
-    const maxAttempts = 150;
-    const batchSize = 2; // Save progress every 2 pages
+    const maxAttempts = 150; // Increased limit
+    const batchSize = 50; // Save progress every N pages
     let consecutiveDuplicates = 0;
-    const duplicateThreshold = 5;
+    const duplicateThreshold = 5; // Stop after N consecutive pages of all duplicates
 
+    // Fetch existing IDs from server ONLY for incremental sync
     let existingIds = new Set();
     if (incremental) {
         try {
             syncState.currentType = 'Checking existing content...';
-            const posts = await VaultDB.getAllPosts();
-            if (Array.isArray(posts)) {
-                existingIds = new Set(posts.map(item => String(item.id)));
+            const response = await fetch('http://localhost:3000/api/saved?limit=50000');
+            const data = await response.json();
+            if (data.success && data.data) {
+                existingIds = new Set(data.data.map(item => item.id));
                 console.log(`[INCREMENTAL] Found ${existingIds.size} existing items in vault`);
             }
         } catch (e) {
@@ -590,6 +530,7 @@ async function fetchSavedPosts(userId, resumeFromCursor = null, incremental = fa
         }
     }
 
+    // If resuming, notify user
     if (resumeFromCursor) {
         syncState.currentType = 'Resuming from last position...';
         console.log('Resuming sync from cursor:', resumeFromCursor);
@@ -616,48 +557,58 @@ async function fetchSavedPosts(userId, resumeFromCursor = null, incremental = fa
 
             if (!response.ok) {
                 console.log('API response not ok:', response.status);
-                // Try GraphQL fallback if REST fails
-                try {
-                    const graphqlItems = await fetchSavedViaGraphQL(userId);
-                    return [...allItems, ...graphqlItems];
-                } catch (e) {
-                    return allItems;
-                }
+                // Try GraphQL fallback
+                const graphqlItems = await fetchSavedViaGraphQL(userId);
+                return [...allItems, ...graphqlItems];
             }
 
             const data = await response.json();
-            const rawItems = data.items || [];
-            console.log('Got response with', rawItems.length, 'items');
+            console.log('Got response with', data.items?.length || 0, 'items');
 
-            if (rawItems.length > 0) {
-                const processed = rawItems.map(item => processMediaItem(item));
+            if (data.items && data.items.length > 0) {
+                const processed = data.items.map(item => processMediaItem(item));
 
+                // If incremental mode, check for duplicates and stop early
                 if (incremental && existingIds.size > 0) {
-                    const newItems = processed.filter(item => !existingIds.has(String(item.id)));
+                    const newItems = processed.filter(item => !existingIds.has(item.id));
                     const duplicateCount = processed.length - newItems.length;
 
                     if (newItems.length > 0) {
                         allItems.push(...newItems);
-                        consecutiveDuplicates = 0;
-                        await sendToLocalServer(newItems, loginStatus || { userId, username: 'User' });
+                        consecutiveDuplicates = 0; // Reset counter
                         console.log(`[INCREMENTAL] Page ${attempts + 1}: ${newItems.length} new, ${duplicateCount} already synced`);
                     } else {
                         consecutiveDuplicates++;
                         console.log(`[INCREMENTAL] Page ${attempts + 1}: All ${processed.length} items already synced (${consecutiveDuplicates}/${duplicateThreshold})`);
                     }
 
+                    // Stop if we've hit too many consecutive pages of all duplicates
                     if (consecutiveDuplicates >= duplicateThreshold) {
                         console.log(`[INCREMENTAL] Stopping - reached ${duplicateThreshold} consecutive pages of duplicates`);
-                        syncState.currentType = `Found ${allItems.length} new items. Older content already synced.`;
+                        syncState.currentType = `Found ${newItems.length} new items. Older content already synced.`;
                         hasMore = false;
-                        break;
+                        break; // Will sync the remaining batch below
                     }
                 } else {
+                    // Full sync - add all items
                     allItems.push(...processed);
-                    // Pre-sync batch to VaultDB immediately
-                    await sendToLocalServer(processed, loginStatus || { userId, username: 'User' });
-                    if (syncState.options.downloadMedia !== false) {
-                        cacheThumbnailsToServer(processed).catch(() => {});
+                }
+
+                                // ✅ FIX 1 — Envoie CHAQUE page au serveur (le serveur déduplique par ID).
+                // Envoyer des doublons ne pose aucun problème grâce au merge dans /api/sync.
+                if (processed.length > 0) {
+                    console.log(`📦 Batch sync: sending ${processed.length} items from page ${attempts + 1} to server...`);
+                    try {
+                        await sendToLocalServer(processed, loginStatus);
+                        if (syncState.options.downloadMedia !== false) {
+                            // Non-bloquant pour ne pas ralentir le sync
+                            cacheThumbnailsToServer(processed).catch(e =>
+                                console.log('Thumbnail cache error:', e.message)
+                            );
+                        }
+                    } catch (e) {
+                        console.error('Batch sync failed for page', attempts + 1, ':', e.message);
+                        // On ne throw pas : on continue la pagination et on retentera
                     }
                 }
 
@@ -668,16 +619,17 @@ async function fetchSavedPosts(userId, resumeFromCursor = null, incremental = fa
                     : `Fetching posts... (${allItems.length} found, page ${attempts + 1})`;
             }
 
-            hasMore = data.more_available === true && !!data.next_max_id;
+            hasMore = data.more_available === true;
             maxId = data.next_max_id;
             attempts++;
 
-            // Save cursor checkpoint so we can resume
-            if (maxId) {
-                await saveSyncCursor(maxId, allItems.length, 'rest', null);
+            // Save cursor periodically so we can resume if interrupted
+            if (attempts % batchSize === 0 && maxId) {
+                await saveSyncCursor(maxId, allItems.length);
                 console.log(`Saved progress: ${allItems.length} items, cursor: ${maxId}`);
             }
 
+            // Rate limiting - slightly longer delay to avoid blocks
             if (hasMore) {
                 await sleep(1000);
             }
@@ -685,55 +637,48 @@ async function fetchSavedPosts(userId, resumeFromCursor = null, incremental = fa
         } catch (error) {
             console.error('Error fetching page:', error);
             syncState.currentType = `Error on page ${attempts + 1}, stopping...`;
+            // Save cursor before stopping so we can resume
             if (maxId) {
-                await saveSyncCursor(maxId, allItems.length, 'rest', null);
+                await saveSyncCursor(maxId, allItems.length);
             }
             break;
         }
     }
 
-    // Save cursor with correct phase tracking
-    if (hasMore && maxId) {
-        // REST has more pages - save REST cursor
-        await saveSyncCursor(maxId, allItems.length, 'rest', null);
-        syncState.currentType = `Fetched ${allItems.length} items. More available - use "Continue Sync" later.`;
+    // Save final cursor for future continuation
+    if (maxId && hasMore) {
+         await saveSyncCursor(maxId, allItems.length);
+            syncState.currentType = `Fetched ${allItems.length} items. More available - use "Continue Sync" later.`;
+    } else if (hasMore) {
+    // Limite d'attempts atteinte, on garde le curseur pour reprendre
+        await saveSyncCursor(maxId, allItems.length);
+        syncState.currentType = `Paused at ${allItems.length} items (hit page limit). Use Continue Sync.`;
     } else {
-        // REST is exhausted - mark phase as 'graphql' so Continue Sync skips REST
-        console.log('[REST] REST API exhausted. Marking phase as graphql for future Continue Sync.');
-        const curVault = await VaultDB.getAllPosts();
-        await saveSyncCursor(null, curVault.length, 'graphql', null);
+        await chrome.storage.local.remove(['syncCursor', 'syncProgress']);
     }
 
     return allItems;
 }
 
-// Save sync cursor for resumability - tracks BOTH REST and GraphQL phases
-async function saveSyncCursor(cursor, itemCount, phase, graphqlCursor) {
-    try {
-        await chrome.storage.local.set({
-            syncCursor: cursor || null,
-            syncProgress: itemCount || 0,
-            syncPhase: phase || 'rest',        // 'rest' or 'graphql'
-            syncGraphqlCursor: graphqlCursor || null,
-            syncTimestamp: Date.now()
-        });
-    } catch (e) {}
+// Save sync cursor for resumability
+async function saveSyncCursor(cursor, itemCount) {
+    await chrome.storage.local.set({
+        syncCursor: cursor,
+        syncProgress: itemCount,
+        syncTimestamp: Date.now()
+    });
 }
 
 // Get saved sync cursor
 async function getSyncCursor() {
-    try {
-        const data = await chrome.storage.local.get(['syncCursor', 'syncProgress', 'syncTimestamp', 'syncPhase', 'syncGraphqlCursor']);
-        if (data.syncCursor || data.syncGraphqlCursor) {
-            return {
-                cursor: data.syncCursor || null,
-                itemCount: data.syncProgress || 0,
-                timestamp: data.syncTimestamp,
-                phase: data.syncPhase || 'rest',
-                graphqlCursor: data.syncGraphqlCursor || null
-            };
-        }
-    } catch (e) {}
+    const data = await chrome.storage.local.get(['syncCursor', 'syncProgress', 'syncTimestamp']);
+    if (data.syncCursor) {
+        return {
+            cursor: data.syncCursor,
+            itemCount: data.syncProgress || 0,
+            timestamp: data.syncTimestamp
+        };
+    }
     return null;
 }
 
@@ -993,32 +938,39 @@ function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Save scraped data directly to IndexedDB
+// Send data to local server
 async function sendToLocalServer(content, loginStatus) {
     try {
-        console.log(`💾 Saving ${content.length} items directly to IndexedDB...`);
-        await VaultDB.init();
-        await VaultDB.savePosts(content);
-
-        const profile = {
-            userId: loginStatus.userId,
-            username: loginStatus.username,
-            fullName: loginStatus.fullName,
-            profilePic: loginStatus.profilePic,
-            lastSync: new Date().toISOString()
-        };
-        await VaultDB.setUser(profile);
-
-        await chrome.storage.local.set({
-            savedContentCount: content.length,
-            lastSync: new Date().toISOString(),
-            user: profile
+        const response = await fetch('http://localhost:3000/api/sync', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                userId: loginStatus.userId,
+                username: loginStatus.username,
+                fullName: loginStatus.fullName,
+                profilePic: loginStatus.profilePic,
+                content: content,
+                syncedAt: new Date().toISOString()
+            })
         });
 
-        return { success: true, count: content.length };
+        if (!response.ok) {
+            const text = await response.text();
+            throw new Error(`Server error: ${text}`);
+        }
+
+        return await response.json();
     } catch (error) {
-        console.error('VaultDB save error:', error.message);
-        throw error;
+        console.log('Server not available:', error.message);
+        // Store locally as backup
+        await chrome.storage.local.set({
+            savedContent: content,
+            lastSync: new Date().toISOString(),
+            user: loginStatus
+        });
+        throw new Error('Local vault server not running. Please make sure the server is started.');
     }
 }
 
@@ -1039,8 +991,17 @@ async function blobToBase64(blob) {
 }
 
 async function cacheThumbnailsToServer(content) {
-    await VaultDB.init();
+    // Check which thumbnails are already cached to avoid duplicate work
+    let alreadyCachedStats = null;
+    try {
+        const statsResp = await fetch('http://localhost:3000/api/cache-stats');
+        if (statsResp.ok) {
+            alreadyCachedStats = await statsResp.json();
+            console.log(`Server already has ${alreadyCachedStats.stats?.cachedCount || 0} thumbnails cached.`);
+        }
+    } catch (e) { }
 
+    // Filter items that have thumbnail URLs
     const itemsToCache = content.filter(item => {
         const url = item.thumbnailUrl || item.mediaUrl;
         return url && item.id;
@@ -1048,63 +1009,94 @@ async function cacheThumbnailsToServer(content) {
 
     if (itemsToCache.length === 0) return;
 
-    console.log(`📸 Starting background caching of ${itemsToCache.length} thumbnails to IndexedDB...`);
+    console.log(`📸 Starting background caching of ${itemsToCache.length} thumbnails...`);
     let cached = 0, failed = 0, skipped = 0;
-    const batchSize = 3;
+    const batchSize = 3; // Smaller batch size to prevent Instagram rate-limiting
 
     for (let i = 0; i < itemsToCache.length; i += batchSize) {
         const batch = itemsToCache.slice(i, i + batchSize);
 
-        await Promise.all(batch.map(async (item) => {
+        // Update progress on service worker console
+        if (i % 30 === 0 && i !== 0) {
+            console.log(`📸 Caching Progress: ${cached} cached, ${failed} failed, ${skipped} skipped (${i}/${itemsToCache.length})`);
+        }
+
+        await Promise.allSettled(batch.map(async (item) => {
             try {
-                const exists = await VaultDB.hasMedia(item.id);
-                if (exists) {
+                // Check if already cached on server via HEAD request
+                const checkResp = await fetch(`http://localhost:3000/api/thumbnails/${item.id}`, { method: 'HEAD' });
+                if (checkResp.ok) {
                     skipped++;
-                    return;
-                }
+                } else {
+                    const url = item.thumbnailUrl || item.mediaUrl;
+                    // Attempt to download the image directly (avoids parsing HTML if it's an image link)
+                    const response = await fetch(url);
+                    
+                    // Verify that what we got back is actually an image, not a login redirect page
+                    const contentType = response.headers.get("content-type");
+                    if (!response.ok || !contentType || !contentType.includes("image")) {
+                        failed++;
+                        return; // Probably rate-limited or redirected
+                    }
 
-                const url = item.thumbnailUrl || item.mediaUrl;
-                const response = await fetch(url);
-                if (!response.ok) {
-                    failed++;
-                    return;
-                }
+                    const blob = await response.blob();
+                    const base64 = await blobToBase64(blob);
 
-                const blob = await response.blob();
-                await VaultDB.saveMedia(item.id, blob, blob.type, 'thumbnail');
-                cached++;
+                    // Send base64 to local Node server
+                    const saveResp = await fetch('http://localhost:3000/api/cache-thumbnail-data', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ id: item.id, imageData: base64 })
+                    });
 
-                if (item.carouselMedia && item.carouselMedia.length > 1) {
-                    for (let c = 1; c < item.carouselMedia.length; c++) {
-                        const cm = item.carouselMedia[c];
-                        const cmUrl = cm.thumbnailUrl || cm.imageUrl;
-                        const carouselCacheId = `${item.id}_c${cm.index || c}`;
-
-                        if (cmUrl) {
-                            try {
-                                const cmExists = await VaultDB.hasMedia(carouselCacheId);
-                                if (!cmExists) {
-                                    const cmResp = await fetch(cmUrl);
-                                    if (cmResp.ok) {
-                                        const cmBlob = await cmResp.blob();
-                                        await VaultDB.saveMedia(carouselCacheId, cmBlob, cmBlob.type, 'thumbnail');
-                                    }
-                                }
-                            } catch (e) { }
-                        }
+                    if (saveResp.ok) {
+                        cached++;
+                    } else {
+                        failed++;
                     }
                 }
-            } catch (err) {
+
+                // Also deeply cache carousel images per-slide (using _c{index} keys)
+                if (item.carouselMedia && item.carouselMedia.length > 1) {
+                    for (let ci = 0; ci < item.carouselMedia.length; ci++) {
+                        const cm = item.carouselMedia[ci];
+                        const carouselCacheId = `${item.id}_c${ci}`;
+                        const cmUrl = cm.imageUrl || cm.thumbnailUrl;
+                        if (!cmUrl) continue;
+
+                        try {
+                            const cmCheck = await fetch(`http://localhost:3000/api/thumbnails/${carouselCacheId}`, { method: 'HEAD' });
+                            if (cmCheck.ok) continue; // Already cached
+                            
+                            const cmResp = await fetch(cmUrl);
+                            const cmType = cmResp.headers.get("content-type");
+                            if (cmResp.ok && cmType && cmType.includes("image")) {
+                                const cmBlob = await cmResp.blob();
+                                const cmBase64 = await blobToBase64(cmBlob);
+                                await fetch('http://localhost:3000/api/cache-thumbnail-data', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ id: carouselCacheId, imageData: cmBase64 })
+                                });
+                            }
+                        } catch (e) { }
+                    }
+                }
+            } catch (e) {
                 failed++;
             }
         }));
 
-        await sleep(350);
+        // Backoff slightly between internal batches to avoid triggering Instagram's scraper defenses
+        await sleep(150);
     }
 
-    console.log(`✅ Background thumbnail caching complete: ${cached} cached, ${skipped} skipped, ${failed} failed.`);
+    console.log(`📸 Thumbnail background caching complete: ${cached} cached, ${failed} failed, ${skipped} already cached`);
 }
 
+// ===================================
+// On-Demand Video Refresh
+// ===================================
 async function refreshVideoUrl(instagramId, mediaId) {
     console.log('🔄 Refreshing video URL for:', instagramId);
 
@@ -1341,61 +1333,115 @@ async function refreshThumbnailUrl(instagramId, mediaId) {
 // Cache a single refreshed item's media to the server immediately
 async function cacheRefreshedMediaToServer(itemId, result) {
     try {
-        await VaultDB.init();
-
+        // 1. Cache the thumbnail image
         if (result.thumbnailUrl) {
             try {
                 const resp = await fetch(result.thumbnailUrl);
                 if (resp.ok) {
                     const blob = await resp.blob();
-                    await VaultDB.saveMedia(itemId, blob, blob.type, 'thumbnail');
+                    const base64 = await blobToBase64(blob);
+                    await fetch('http://localhost:3000/api/cache-thumbnail-data', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ id: itemId, imageData: base64 })
+                    });
                     console.log(`✅ Permanently cached thumbnail for ${itemId}`);
                 }
             } catch (e) { console.warn('Thumbnail cache failed:', e.message); }
         }
 
-        if (result.mediaUrl && result.type === 'reel') {
+        // 2. Cache the main video (if this is a reel/video)
+        // Key fix: we download it HERE in the extension (while authenticated) and push to server
+        if (result.mediaUrl && result.mediaUrl !== result.thumbnailUrl) {
             try {
-                const exists = await VaultDB.hasMedia(itemId);
-                if (!exists) {
-                    const videoResp = await fetch(result.mediaUrl);
+                // Check if already cached
+                const checkResp = await fetch(`http://localhost:3000/api/check-video-cached?id=${itemId}`);
+                const checkData = await checkResp.json();
+                if (!checkData.cached) {
+                    console.log(`📥 Downloading video for ${itemId} while authenticated...`);
+                    const videoResp = await fetch(result.mediaUrl, {
+                        headers: { 'Referer': 'https://www.instagram.com/' },
+                        credentials: 'include'
+                    });
                     if (videoResp.ok) {
                         const videoBlob = await videoResp.blob();
-                        await VaultDB.saveMedia(itemId, videoBlob, 'video/mp4', 'video');
-                        console.log(`✅ Permanently cached video for ${itemId}`);
+                        if (videoBlob.size > 1000) {
+                            const videoBase64 = await blobToBase64(videoBlob);
+                            const saveResp = await fetch('http://localhost:3000/api/cache-video-data', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ id: itemId, videoData: videoBase64 })
+                            });
+                            if (saveResp.ok) {
+                                console.log(`✅ Permanently cached video for ${itemId} (${(videoBlob.size / 1024 / 1024).toFixed(1)} MB)`);
+                            }
+                        }
+                    } else {
+                        console.warn(`❌ Could not download video for ${itemId}: HTTP ${videoResp.status}`);
                     }
+                } else {
+                    console.log(`⏭ Video already cached for ${itemId}`);
                 }
             } catch (e) { console.warn('Video cache failed:', e.message); }
         }
 
-        if (Array.isArray(result.carouselMedia) && result.carouselMedia.length > 0) {
-            for (const slide of result.carouselMedia) {
-                const carouselId = `${itemId}_c${slide.index}`;
+        // 3. Cache carousel images and videos
+        if (result.carouselUrls && result.carouselUrls.length > 1) {
+            for (let i = 0; i < result.carouselUrls.length; i++) {
+                const slide = result.carouselUrls[i];
+                
+                // Carousel thumbnail
                 if (slide.imageUrl) {
                     try {
                         const cmResp = await fetch(slide.imageUrl);
                         if (cmResp.ok) {
                             const cmBlob = await cmResp.blob();
-                            await VaultDB.saveMedia(carouselId, cmBlob, cmBlob.type, 'thumbnail');
+                            const cmBase64 = await blobToBase64(cmBlob);
+                            await fetch('http://localhost:3000/api/cache-thumbnail-data', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ id: `${itemId}_c${i}`, imageData: cmBase64 })
+                            });
                         }
-                    } catch (e) { }
+                    } catch (e) { /* skip */ }
                 }
-                if (slide.videoUrl) {
+
+                // Carousel video slide
+                if (slide.isVideo && slide.videoUrl) {
                     try {
-                        const cmVideoResp = await fetch(slide.videoUrl);
-                        if (cmVideoResp.ok) {
-                            const cmVideoBlob = await cmVideoResp.blob();
-                            await VaultDB.saveMedia(carouselId, cmVideoBlob, 'video/mp4', 'video');
+                        const carouselId = `${itemId}_c${i}`;
+                        const checkResp = await fetch(`http://localhost:3000/api/check-video-cached?id=${carouselId}`);
+                        const checkData = await checkResp.json();
+                        if (!checkData.cached) {
+                            const cvResp = await fetch(slide.videoUrl, {
+                                headers: { 'Referer': 'https://www.instagram.com/' },
+                                credentials: 'include'
+                            });
+                            if (cvResp.ok) {
+                                const cvBlob = await cvResp.blob();
+                                if (cvBlob.size > 1000) {
+                                    const cvBase64 = await blobToBase64(cvBlob);
+                                    await fetch('http://localhost:3000/api/cache-video-data', {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ id: carouselId, videoData: cvBase64 })
+                                    });
+                                    console.log(`✅ Cached carousel video slide ${i} for ${itemId}`);
+                                }
+                            }
                         }
-                    } catch (e) { }
+                    } catch (e) { /* skip */ }
                 }
+
+                await sleep(200); // small gap between carousel items
             }
         }
-    } catch (error) {
-        console.error('cacheRefreshedMediaToServer error:', error);
+    } catch (e) {
+        console.error('Error caching refreshed media:', e);
     }
 }
 
+// Batch refresh thumbnails
 async function batchRefreshThumbnails(items, sender) {
     console.log(`🔄 Batch refreshing ${items.length} thumbnails`);
     const results = [];
@@ -1464,51 +1510,172 @@ async function repairBrokenImages(sender) {
     repairState = { running: true, total: 0, processed: 0, cached: 0, failed: 0, skipped: 0, currentItem: null };
 
     try {
-        await VaultDB.init();
-        const posts = await VaultDB.getAllPosts();
-        repairState.total = posts.length;
+        // Get the full count of uncached items
+        const countResp = await fetch('http://localhost:3000/api/uncached-items?limit=1&offset=0');
+        const countData = await countResp.json();
+        repairState.total = countData.total || 0;
 
         if (repairState.total === 0) {
             repairState.running = false;
-            return { success: true, message: 'No items in vault to repair.', cached: 0, failed: 0, total: 0 };
+            return { success: true, message: 'All images already cached!', cached: 0, failed: 0, total: 0 };
         }
 
-        console.log(`🔧 Starting repair scan of ${repairState.total} items...`);
+        console.log(`🔧 Starting repair of ${repairState.total} uncached items...`);
 
-        for (let i = 0; i < posts.length; i++) {
-            const item = posts[i];
-            repairState.processed = i + 1;
-            repairState.currentItem = item.id;
+        const batchSize = 50; // Fetch items in batches
+        let offset = 0;
+        let hasMore = true;
 
-            const has = await VaultDB.hasMedia(item.id);
-            if (!has && (item.instagramId || item.id)) {
+        while (hasMore && repairState.running) {
+            const resp = await fetch(`http://localhost:3000/api/uncached-items?limit=${batchSize}&offset=${offset}`);
+            if (!resp.ok) break;
+            const data = await resp.json();
+            const items = data.items || [];
+
+            if (items.length === 0) break;
+            hasMore = data.hasMore;
+
+            // Process each item in this batch
+            for (const item of items) {
+                if (!repairState.running) break; // Allow cancellation
+
+                repairState.currentItem = item.instagramId || item.id;
+                repairState.processed++;
+
                 try {
-                    const fresh = await refreshThumbnailUrl(item.instagramId || item.id, item.id);
-                    if (fresh && fresh.success) {
-                        repairState.cached++;
-                    } else {
+                    // Step 1: Try to reuse the stored URL first (might still be valid for recent items)
+                    const storedUrl = item.thumbnailUrl || item.mediaUrl;
+                    let cached = false;
+
+                    if (storedUrl) {
+                        try {
+                            const directResp = await fetch(storedUrl);
+                            const ct = directResp.headers.get('content-type');
+                            if (directResp.ok && ct && ct.includes('image')) {
+                                const blob = await directResp.blob();
+                                if (blob.size > 500) {
+                                    const base64 = await blobToBase64(blob);
+                                    const saveResp = await fetch('http://localhost:3000/api/cache-thumbnail-data', {
+                                        method: 'POST',
+                                        headers: { 'Content-Type': 'application/json' },
+                                        body: JSON.stringify({ id: item.id, imageData: base64 })
+                                    });
+                                    if (saveResp.ok) {
+                                        cached = true;
+                                        repairState.cached++;
+                                    }
+                                }
+                            }
+                        } catch (e) { /* stored URL expired - fall through to refresh */ }
+                    }
+
+                    // Step 2: If stored URL failed, fetch fresh URL from Instagram API
+                    if (!cached && item.instagramId) {
+                        const refreshResult = await refreshThumbnailUrl(item.instagramId, item.id);
+                        if (refreshResult.success && refreshResult.thumbnailUrl) {
+                            // Cache the main thumbnail
+                            try {
+                                const freshResp = await fetch(refreshResult.thumbnailUrl);
+                                const ct = freshResp.headers.get('content-type');
+                                if (freshResp.ok && ct && ct.includes('image')) {
+                                    const blob = await freshResp.blob();
+                                    if (blob.size > 500) {
+                                        const base64 = await blobToBase64(blob);
+                                        const saveResp = await fetch('http://localhost:3000/api/cache-thumbnail-data', {
+                                            method: 'POST',
+                                            headers: { 'Content-Type': 'application/json' },
+                                            body: JSON.stringify({ id: item.id, imageData: base64 })
+                                        });
+                                        if (saveResp.ok) {
+                                            cached = true;
+                                            repairState.cached++;
+
+                                            // Also update the stored URL in the database so it stays fresh
+                                            await fetch('http://localhost:3000/api/update-thumbnail-url', {
+                                                method: 'POST',
+                                                headers: { 'Content-Type': 'application/json' },
+                                                body: JSON.stringify({
+                                                    id: item.id,
+                                                    thumbnailUrl: refreshResult.thumbnailUrl,
+                                                    mediaUrl: refreshResult.mediaUrl || refreshResult.thumbnailUrl
+                                                })
+                                            });
+                                        }
+                                    }
+                                }
+                            } catch (e) { /* image download failed */ }
+
+                            // Cache carousel slides too
+                            if (refreshResult.carouselUrls && refreshResult.carouselUrls.length > 1) {
+                                for (let ci = 0; ci < refreshResult.carouselUrls.length; ci++) {
+                                    const cmUrl = refreshResult.carouselUrls[ci].imageUrl;
+                                    if (!cmUrl) continue;
+                                    try {
+                                        const cmResp = await fetch(cmUrl);
+                                        const cmCt = cmResp.headers.get('content-type');
+                                        if (cmResp.ok && cmCt && cmCt.includes('image')) {
+                                            const cmBlob = await cmResp.blob();
+                                            if (cmBlob.size > 500) {
+                                                const cmBase64 = await blobToBase64(cmBlob);
+                                                await fetch('http://localhost:3000/api/cache-thumbnail-data', {
+                                                    method: 'POST',
+                                                    headers: { 'Content-Type': 'application/json' },
+                                                    body: JSON.stringify({ id: `${item.id}_c${ci}`, imageData: cmBase64 })
+                                                });
+                                            }
+                                        }
+                                    } catch (e) { /* carousel slide failed */ }
+                                    await sleep(100); // small delay between carousel slides
+                                }
+                            }
+                        } else {
+                            repairState.failed++;
+                        }
+                    } else if (!cached) {
                         repairState.failed++;
                     }
+
+                    // Send progress update to the frontend page
+                    // Use chrome.runtime.sendMessage to broadcast to listeners
+                    try {
+                        chrome.runtime.sendMessage({
+                            type: 'REPAIR_PROGRESS',
+                            payload: { ...repairState }
+                        });
+                    } catch (e) { /* no listeners */ }
+
                 } catch (e) {
                     repairState.failed++;
+                    console.log(`Failed to repair item ${item.id}:`, e.message);
                 }
-            } else {
-                repairState.skipped++;
+
+                // Rate limit: significantly slower (1.5s to 3.5s) to avoid Instagram blocking account!
+                const delay = 1500 + Math.random() * 2000;
+                await sleep(delay);
             }
 
-            if (sender?.tab?.id && i % 5 === 0) {
-                chrome.tabs.sendMessage(sender.tab.id, {
-                    type: 'REPAIR_PROGRESS',
-                    payload: { ...repairState }
-                }).catch(() => {});
-            }
+            offset += batchSize;
+            // Larger delay between batches (5 to 10 seconds)
+            const batchDelay = 5000 + Math.random() * 5000;
+            await sleep(batchDelay);
         }
 
         repairState.running = false;
-        return { success: true, ...repairState };
-    } catch (e) {
+        repairState.currentItem = null;
+        console.log(`🔧 Repair complete: ${repairState.cached} cached, ${repairState.failed} failed, ${repairState.skipped} skipped`);
+
+        return {
+            success: true,
+            total: repairState.total,
+            cached: repairState.cached,
+            failed: repairState.failed,
+            message: `Repaired ${repairState.cached} images. ${repairState.failed} could not be fetched.`
+        };
+
+    } catch (error) {
         repairState.running = false;
-        console.error('Repair tool error:', e);
-        return { success: false, error: e.message };
+        console.error('Repair error:', error);
+        return { success: false, error: error.message };
     }
 }
+
